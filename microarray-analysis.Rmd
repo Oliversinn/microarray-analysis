@@ -1,0 +1,403 @@
+---
+title: 'Análisis de microarrays'
+author: "Oliver Mazariegos"
+date: "`r Sys.Date()`"
+bibliography: citations.bib
+nocite: '@*'
+output:
+  html_document:
+    number_sections: no
+    toc: yes
+    fig_width: 8
+    fig_height: 6
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: yes
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      comment=NA, 
+                      cache = TRUE, 
+                      message = FALSE, 
+                      warning = FALSE)
+```
+
+# Introducción
+
+En este proyecto utilizaremos el articulo [Dectin-1 Stimulation by Candida albicans Yeast or Zymosan Triggers NFAT
+Activation in Macrophages and Dendritic Cells](https://journals.aai.org/jimmunol/article/178/5/3107/74255/Dectin-1-Stimulation-by-Candida-albicans-Yeast-or) junto con sus datos generados, que pueden encontrarse con el número de accesos GSE6376 en GEO.
+
+
+En este estudio, los investigadores resaltan la importancia del receptor de beta-glucano Dectin-1 para el reconocimiento de hongos patogénicos por macrófagos y células dendríticas. También creen que han encontrado los mecanismos de señalamiento por Dectin-1 para coordinar la respuesta antifúngica. Los investigadores demuestran que la señalización de Dectin-1 también puede modular directamente la expresión génica a través de la activación de la transcripción nuclear de factores de transcripción de células T activadas (NFAT). La ligadura de Dectin-1 con párticulas de zimosano desencadena la activación de NFAT en los macrófagos y células dendríticas. La activación de NFAT por Dectin-1 juega un rol en la induccion de los factores de transcripción Egr2 y Egr3 junto con Cox-2. Además demuestran que la activación de NFAT regula la producción de IL-2, IL-10 y IL-12 p70 por células dendríticas estimuladas por zymosan.
+
+En las muestras depositdas en GEO tenemos dos muestras de macrófagos derivados de la médula ósea, MyD88 -/-, sin estimulación (WT) y dos muestas de macrófagos estimulados con Zymosan por 120 minutos (TLR; toll like receptor)
+
+
+# Objetivos
+
+El objetivo principal de este reporte es intentar replicar los hallazgos realizados por los autores en el artículo de referencia utilizando sus datos publicados en GEO
+
+* Identificar los genes que pueden ser regulados por medio de la estimulación con Zymosan en Dectin-1.
+
+* Detectar la significación biológica de los genes que pueden ser regulados por medio de la estimulación con Zymosan en Dectin-1.
+
+# Librerías
+
+```{r libraries, message=FALSE, warning=FALSE}
+workingDir <- getwd()
+dataDir <- file.path(workingDir, "GSE6376_RAW")
+resultsDir <- file.path(workingDir, "results")
+
+if (!require(BiocManager)) install.packages("BiocManager")
+
+installifnot <- function(pkg) {
+    if (!require(pkg, character.only = T)) {
+        BiocManager::install(pkg)
+    }
+}
+installifnot("mouse4302.db")
+installifnot("oligo")
+installifnot("limma")
+installifnot("Biobase")
+installifnot("arrayQualityMetrics")
+installifnot("genefilter")
+installifnot("annotate")
+installifnot("xtable")
+installifnot("gplots")
+installifnot("GOstats")
+installifnot("clusterProfiler")
+installifnot('org.Hs.eg.db')
+installifnot('enrichplot')
+library(knitr)
+library(dplyr)
+```
+
+# Lectura de datos
+
+Para la lectura de datos, se han descargado los archivos .CEL desde GEO y se ha creado un archivo targets.csv con la información y rutas de acceso a cada archivo.
+
+```{r targets, warning=FALSE}
+# TARGETS
+targetsDF <- read.csv(file = file.path(dataDir, "targets.csv"), 
+                      header = TRUE, 
+                      sep = ",")
+# DEFINE SOME VARIABLES FOR PLOTS
+sampleNames <- as.character(targetsDF$ShortName)
+sampleColor <- as.character(targetsDF$Colors)
+# Creamos un objeto AnnotatedDataFrame
+targets <- AnnotatedDataFrame(targetsDF)
+
+kable(targetsDF)
+```
+
+Con la información de targets.csv ahora podemor cargar los archivos .CEL al entorno de ejecución.
+
+```{r readCelFiles, warning=FALSE}
+CELfiles <- targetsDF$fileName
+rawData <- read.celfiles(file.path(dataDir, CELfiles), phenoData = targets)
+rawData
+```
+
+Algo importante de mencionar es que de ahora en adelante nos referiremos a las muestras control como WT (wild type) y a las estimuladas por Zymosan como ZYM.
+
+# Exploración y control de calidad de los datos
+
+## Box plot
+
+```{r boxplot}
+# BOXPLOT
+boxplot(rawData, which = "all", las = 2, 
+        main = "Intensity distribution of RAW data",
+    cex.axis = 0.6, col = sampleColor, names = sampleNames)
+```
+
+Los boxplots anteriores representan un resumen de la distribución de intensidad de señal de cada array. Cada boxplot representa un array distinto. Por lo general, uno espera que las cajas tengan posiciones y alturas similares. Podemos ver que los boxplots de los arrays que fueron estimulados con zymosan estan ligeramente más hacia arriba, pero no se detecta una diferencia descomunal. Por lo que podemos concluir que los datos son aceptables. 
+
+## Clustering jerárquico
+
+```{r clustering}
+# HIERARQUICAL CLUSTERING
+clust.euclid.average <- hclust(dist(t(exprs(rawData))), method = "average")
+plot(clust.euclid.average, labels = sampleNames, 
+     main = "Hierarchical clustering of RawData",
+    cex = 0.7, hang = -1)
+```
+
+Con el clustering jerárquico se espera que nuestras muestras se agrupen entre los grupos inicialmente planificados en el estudio. En la figura anterior podemos confirmar que nuestras muestras WT se agrupan entre ellas al igual que en otro grupo se agrupan las muestran ZYM.
+
+## PCA
+
+```{r pca}
+# PRINCIPAL COMPONENT ANALYSIS
+plotPCA <- function(X, labels = NULL, colors = NULL, dataDesc = "",
+                    scale = FALSE,formapunts = NULL, myCex = 0.8, ...) {
+    pcX <- prcomp(t(X), scale = scale)  # o prcomp(t(X))
+    loads <- round(pcX$sdev^2/sum(pcX$sdev^2) * 100, 1)
+    xlab <- c(paste("PC1", loads[1], "%"))
+    ylab <- c(paste("PC2", loads[2], "%"))
+    if (is.null(colors))
+        colors = 1
+    plot(pcX$x[, 1:2], xlab = xlab, ylab = ylab, col = colors, pch = formapunts,
+        xlim = c(min(pcX$x[, 1]) - 1e+05, max(pcX$x[, 1]) + 1e+05), 
+        ylim = c(min(pcX$x[,2]) - 1e+05, max(pcX$x[, 2]) + 1e+05))
+    text(pcX$x[, 1], pcX$x[, 2], labels, pos = 3, cex = myCex)
+    title(paste("Plot of first 2 PCs for expressions in", dataDesc, sep = " "), 
+          cex = 0.8)
+}
+
+plotPCA(exprs(rawData), labels = sampleNames, dataDesc = "raw data", 
+        colors = sampleColor, formapunts = c(rep(16, 4), rep(17, 4)), 
+        myCex = 0.6)
+```
+
+El PCA nos permite describir la muestra utilizando componentes basados en los datos analizados. En la figura anterior podemos observar en el eje x el componente número 1 que describe el 86.6% de los datos. Mientras que en el eje y el componente número 2 representa el 7.6%. Juntos estos componentes representan el 94.2% de la distribución de los datos. Con esta representación se espera que nuestro dos grupos experimentales estén separadas entre si. Podemos observar que nuestro WT se agrupa al lado izquierdo del gráfico mientas que los ZYM por el lado derecho.
+
+# Pre procesamiento
+
+## Normalización
+
+Utilizaremos el método RMA para realizar la normalización de los datos. Este es el Robust Multichip Average algorithm. Este algoritmo permite la normalización de cuantiles.
+
+```{r normalizacion}
+eset <- rma(rawData)
+write.exprs(eset, file.path(resultsDir, "NormData.txt"))
+eset
+```
+
+## Filtrado
+
+Por último filtraremos los datos para que nos quedemos solo con los genes que más se expresen. Esto lo lograremos utilizando el rango intercuantílico, usaremos solo aquellos genes que estén por encima del 75% de los demás.
+
+```{r filtrado}
+annotation(eset) <- 'mouse4302.db'
+eset_filtered <- nsFilter(eset, var.func = IQR, var.cutoff = 0.75,
+                          var.filter = TRUE, require.entrez = TRUE, 
+                          filterByQuantile = TRUE)
+# NUMBER OF GENES REMOVED
+print(eset_filtered)
+# NUMBER OF GENES IN
+print(eset_filtered$eset)
+
+filteredEset <- eset_filtered$eset
+filteredData <- exprs(filteredEset)
+colnames(filteredData) <- pData(eset_filtered$eset)$ShortName
+```
+
+
+# Selección de genes
+
+Construimos un modelo lineal, es decir una matriz de diseño y una de contrastes, para el análisis.
+
+## Matriz de diseño
+
+```{r matriz-diseño}
+treat <- pData(filteredEset)$grupos
+lev <- factor(treat, levels = unique(treat))
+design <- model.matrix(~0 + lev)
+colnames(design) <- levels(lev)
+rownames(design) <- sampleNames
+print(design)
+```
+
+
+## Matriz de contraste
+
+```{r matriz-comparasion}
+# COMPARISON
+cont.matrix1 <- makeContrasts(ZYM.vs.WT = ZYM - WT, levels = design)
+comparisonName <- "Efecto de la Inducción"
+print(cont.matrix1)
+```
+
+## Estimación del modelo
+
+```{r model-fit}
+# MODEL FIT
+fit1 <- lmFit(filteredData, design)
+fit.main1 <- contrasts.fit(fit1, cont.matrix1)
+fit.main1 <- eBayes(fit.main1)
+```
+
+El resultado del análisis se encuentra en el objeto `lmfit` y puede extraerse con la instrucción `topTable`.
+
+En este caso aplicaremos filtros al utilizar `topFold`. Retendremos únicamente los genes con un “log-fold-change” mayor de 3 y un p-valor ajustado inferior a 0.05
+
+
+```{r toptab}
+topTab <- topTable(fit.main1, number = nrow(fit.main1), coef = "ZYM.vs.WT", 
+                   adjust = "fdr",lfc = 3, p.value = 0.05)
+dim(topTab)
+head(topTab)
+```
+
+# Anotación de los resultados
+
+Anotaremos los genes con ENTREZ y su GENE SYMBOL correspondientes a cada probset de nuestra tabla de resultados.
+
+```{r anotation}
+anotaciones <- AnnotationDbi::select(mouse4302.db, 
+                                     keys = rownames(filteredData),
+                                     columns = c("ENTREZID", "SYMBOL"))
+topTabAnotada <- topTab %>%
+    mutate(PROBEID = rownames(topTab)) %>%
+    left_join(anotaciones) %>%
+    arrange(P.Value) %>%
+    select(7, 8, 9, 1:6)
+
+kable(topTabAnotada)
+```
+
+Con este listado de genes estamos cumpliendo el objetivo de identificar los genes que pueden ser regulados por medio de la estimulación con Zymosan en Dectin-1. En listado de genes anterior estamos observando aquellos genes que son diferencialmente expresados al estimular con Zymosan. En el artículo original los autores publican la siguiente tabla:
+
+![](assets/tabla1.png)
+
+Es relevante mencionar que todos los genes detectados por los investigadores tambien los pudimos detectar nosotros en este reporte. Algunos genes de la tabla no tienen el mismo nombre pero hacen referencia al mismo gen. Por ejemplo el *Heat shock protein 1A* es *Hspa1a*.
+
+# Visualización de los resultados: Volcano Plot
+
+```{r volcano_plot, message=FALSE}
+genenames <- AnnotationDbi::select(mouse4302.db, 
+                                   rownames(fit.main1),
+                                   c("SYMBOL"))$SYMBOL
+volcanoplot(fit.main1, highlight = 10, 
+            names = genenames, main = paste("Differentially expressed genes",
+                                            colnames(cont.matrix1), sep = "\n"))
+abline(v = c(-3, 3))
+```
+
+En este gráfico estamos resaltando el nombre de los 10 genes con mayor variación. A simple vista podemos detectar algunos que están presentes en la tabla reportada por los investigadores como Egr3, Egr2 o Hspa1a.
+
+# Visualización de resultados: Heatmap
+
+```{r heatmap}
+selectedRows <- rownames(filteredData) %in% rownames(topTab)
+selectedData <- filteredData[selectedRows, ]
+
+# HEATMAP PLOT
+my_palette <- colorRampPalette(c("blue", "red"))(n = 299)
+library(gplots)
+heatmap.2(selectedData, Rowv = TRUE, Colv = TRUE, 
+          main = "HeatMap ZYM.vs.WT FC>=3", scale = "row", 
+          col = my_palette, sepcolor = "white", sepwidth = c(0.05, 0.05),
+          cexRow = 0.5, cexCol = 0.9, key = TRUE, keysize = 1.5,
+          density.info = "histogram", ColSideColors = c(rep("blue", 2), 
+                                                        rep("red", 2)), 
+          tracecol = NULL, srtCol = 30)
+```
+
+Como hicimos un filtro de los genes que tienen una mayor expresión diferencial en el heatmap podemos ver cuales genes se expresan más o menos en cada uno de nuestros dos grupos.
+
+# Análisis de significación biológica
+
+Realizaremos un análisis de enriquecimiento a partir de la lista de genes seleccionados como diferencialmente expresados. El análisis de enriquecimiento es un método que nos ayudará a identificar clases de genes  sobre representadas. Para esto tendremos que comparar la lista de genes seleccionada contra todo el resto de genes que se han incluído en el análisis.
+
+Para poder anotar los genes necesitamos el identificador en formato "ENTREZ" en ambos listados de genes.
+
+```{r topGenes-Universe, message=FALSE}
+probesUniverse <- rownames(filteredData)
+entrezUniverse <- AnnotationDbi::select(mouse4302.db, probesUniverse,
+    "ENTREZID")$ENTREZID
+
+topProbes <- rownames(selectedData)
+entrezTop <- AnnotationDbi::select(mouse4302.db, topProbes, "ENTREZID")$ENTREZID
+
+# Eliminamos posibles duplicados
+topGenes <- entrezTop[!duplicated(entrezTop)]
+entrezUniverse <- entrezUniverse[!duplicated(entrezUniverse)]
+```
+
+Realizaremos un análisis de enriquecimiento basado en Gene Ontology utilizando el paquete GOstats. Para realizar este análisis debemos crear un hiper parámetro 
+
+```{r hyperGTest, message=FALSE}
+GOparams = new("GOHyperGParams", geneIds = topGenes, 
+               universeGeneIds = entrezUniverse,
+               annotation = "mouse4302.db", 
+               ontology = "BP", pvalueCutoff = 0.01)
+
+GOhyper = hyperGTest(GOparams)
+dim(summary(GOhyper))
+kable(head(summary(GOhyper)))
+```
+
+Podemos ver que el análisis nos devolvió 164 ontologías anotadas. Con este análisis cumplimos nuestro segundo objetivo de detectar la significación biológica de los genes diferencialmente expresados. Si analizamos estas primera filas del resultado, bajo la columna `term` podemos ver que tenemos genes relacionados a respuestas externas. Lo cual coincide con los descubrimientos de los autores que demuestran que al estimular Dectin-1 con zymosan puede activar la respuesta antifungíca de las células.
+
+
+```{r GOResults}
+# Creamos un informe html con los resultados completos
+GOfilename = file.path(resultsDir, "GOResults.html")
+htmlReport(GOhyper, file = GOfilename, summary.args = list(htmlLinks = TRUE))
+```
+
+
+# GO enrichment analysis
+
+Realizaremos ahora el análisis de enriquecimiento utilizando Biological Process (BP) de GO utilizando la función `enrichGO` del paquete `clusterProfiler`.
+
+```{r enrichGO}
+## Run GO enrichment analysis 
+
+ego <- enrichGO(gene = as.integer(topGenes), # selgenes, 
+                # universe = entrezUniverse, # universe = all_genes,
+                keyType = "ENTREZID",
+                OrgDb = mouse4302.db, 
+                ont = "BP", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.25, 
+                readable = TRUE)
+kable(head(ego, n=5))
+```
+
+En la tabla anterior podemos visualizar las ontologías más presentes en los genes sobre representados. Podemos visualizar que el que más está representado es *cytokine-mediated signaling pathway*, el cual tambien es muy mencionado por los autores del árticulo de referencia. Los investigadores mencionan que "La estimulación de las células dendríticas con Zymosan desencadena la liberación de una variedad de citocinas".
+
+## Dotplot
+
+```{r dotplot}
+dotplot(ego, showCategory=5)
+```
+
+En el gráfico anterior podemos ver de una manera más gráfica los 5 procesos biologicos a los que están más relacionados los genes sobre representados. Tambien podemos observar que tres de ellos están relacionados a citocinas y dos de ellas a respuesta de defensa o de virus, siguiendo mucho lo que los autores estan describiendo en su investigación.
+
+## GO terms in hierarchy
+
+```{r goplot}
+goplot(ego, showCategory=5)
+```
+
+Con la vista jerarquica podemos visualizar que los genes están muy relacionados con la ontología de *positive regulation of cytokine-mediated signaling pathway*. Lo cual hace mucho sentido porque los autores concluyen que la estimulación por Zymosan regula la producción de citocinas vinvuladas con la respuesta antifúngica.
+
+## Gene network for the top terms
+
+```{r cnetplot}
+cnetplot(ego) 
+```
+
+En la figura anterior podemos visualizar como se relacionan los genes a los Top 5 terminos de GO de procesos biológicos. En esta última figura se pueden visualizar varios de los genes reportados por los investigadores junto a los procesos que se relacionan a los mecanismos que ellos tambien han descubierto. 
+
+# Conclusiones
+
+* Se han podido replicar los hallazgos y resultados reportados por los investigadores de nuestro artículo de referencia utilizando R y BioConductor.
+* La estimulación de Zymosan en Dectin-1 desencadena la expresión de genes que regulan la producción de citocinas que están relacionadas a la regulación positiva de la respuesta de defensa.
+
+# Referencias
+
+<div id="refs"></div>
+
+
+
+
+.
+
+
+
+
+
+
+
+
+
+
+
+
